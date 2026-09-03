@@ -92,8 +92,12 @@ function generateClashResponse(rawContent) {
     lines.forEach((line, i) => {
         const trimmed = line.trim();
         if (!trimmed || !trimmed.includes("://")) return;
+        // 端口跳跃链接（host:起始-结束）不符合 URL 规范，先拆出端口段再解析，否则 new URL 会抛异常导致节点被丢弃
+        const rangeMatch = trimmed.match(/^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^/?#]+):(\d+)-(\d+)([/?#].*)?$/);
+        const portRange = rangeMatch ? `${rangeMatch[2]}-${rangeMatch[3]}` : null;
+        const normalized = rangeMatch ? `${rangeMatch[1]}:${rangeMatch[2]}${rangeMatch[4] || ""}` : trimmed;
         try {
-            const url = new URL(trimmed);
+            const url = new URL(normalized);
             const protocol = url.protocol.replace(":", "");
             const params = url.searchParams;
             let name = `节点-${i + 1}`;
@@ -122,8 +126,9 @@ function generateClashResponse(rawContent) {
                     p.obfs = "salamander";
                     p["obfs-password"] = params.get("obfs-password");
                 }
-                // 端口跳跃（可选），Clash 字段为 ports
+                // 端口跳跃（可选），Clash 字段为 ports；支持 ?mport= 参数和 host:起始-结束 两种写法
                 if (params.get("mport")) p.ports = params.get("mport");
+                if (portRange) p.ports = portRange;
             } else if (protocol === "vless") {
                 p.uuid = url.username;
                 p.tls = params.get("security") === "tls" || params.get("security") === "reality";
