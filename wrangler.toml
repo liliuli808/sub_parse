@@ -1,0 +1,7 @@
+name = "soft-unit-b360"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+
+[[kv_namespaces]]
+binding = "sub"
+id = "3315e7f6e9c14874bc4ae283725f2521"
