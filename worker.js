@@ -87,6 +87,7 @@ export default {
 function generateClashResponse(rawContent) {
     const lines = rawContent.split(/\r?\n/);
     const proxies = [];
+    const usedNames = new Set();
 
     lines.forEach((line, i) => {
         const trimmed = line.trim();
@@ -97,6 +98,14 @@ function generateClashResponse(rawContent) {
             const params = url.searchParams;
             let name = `节点-${i + 1}`;
             try { name = decodeURIComponent(url.hash.replace("#", "")) || name; } catch (_) {}
+
+            // 名称去重：重名时自动追加序号，避免 Clash 报 duplicate name
+            if (usedNames.has(name)) {
+                let n = 2;
+                while (usedNames.has(`${name}-${n}`)) n++;
+                name = `${name}-${n}`;
+            }
+            usedNames.add(name);
 
             let p = {
                 name, type: protocol, server: url.hostname, port: parseInt(url.port),
