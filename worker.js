@@ -120,6 +120,7 @@ function generateClashResponse(rawContent) {
             if (protocol === "hysteria2" || protocol === "hy2") {
                 p.type = "hysteria2";
                 p.password = decodeURIComponent(url.username || url.password || "");
+                p["skip-cert-verify"] = ["1", "true"].includes((params.get("insecure") || "").toLowerCase());
                 if (params.get("sni")) p.sni = params.get("sni");
                 // salamander 混淆（可选）
                 if (params.get("obfs") === "salamander" && params.get("obfs-password")) {
@@ -321,4 +322,3 @@ function getDashboardHTML(links) {
     </script>
   </body></html>`;
 }
-
