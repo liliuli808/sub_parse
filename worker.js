@@ -1,15 +1,79 @@
 /**
  * SubLink Pro - 可视化管理完整修复版
  * 功能：可视化节点编辑、自动解析链接名称、中文乱码修复、Clash 配置分发
+ *      分场景节点副本（同一节点按带宽档位展开为多个副本）
  */
 
 const SESSION_COOKIE = "__Host-sublink_session";
+
+/**
+ * ============================================================
+ *  分场景节点副本
+ * ------------------------------------------------------------
+ *  为什么需要：
+ *  hysteria2 的 up / down 是「硬上限」，而且只有客户端主动声明了带
+ *  宽，才会启用 Brutal 拥塞控制；不声明就退回 BBR，在高 RTT 链路上
+ *  单流速度会差一个数量级（实测 5.3 → 66 Mbps）。
+ *
+ *  麻烦在于：同一个订阅会同时被家宽、手机 4G、弱网热点等不同网络
+ *  使用，写死单一档位必然顾此失彼——
+ *    按家宽填 → 手机上超发，持续重传、白烧流量、连接不稳；
+ *    按手机填 → 家宽白白损失一半以上速度。
+ *
+ *  解决办法：在生成侧把每个 hysteria2 节点的多个档位各做成一个独立
+ *  节点，各端按当前网络挑对应档位即可（切节点即切场景），
+ *  不需要给每台设备单独改配置。
+ *
+ *  订阅地址加 ?scene=0 可临时关闭本功能，返回原始节点。
+ * ============================================================
+ */
+// 导出是为了让测试能切换 matchMode；Cloudflare Worker 只取 default 导出，
+// 多一个命名导出不影响部署
+export const SCENE = {
+    enabled: true,
+
+    // 命中方式：
+    //   "all"  → 所有 hysteria2 / hy2 节点（默认）。新增节点会自动纳入，
+    //            不需要回来改配置，也就不会再出现「漏配某个节点」的情况。
+    //   "list" → 只处理下面 matchNames / matchServers 白名单里的节点
+    matchMode: "all",
+
+    // 仅 matchMode: "list" 时生效：节点名称或服务器地址，任一命中即可
+    matchNames: ["日本2", "奔哥专用"],
+    matchServers: ["142.91.106.165", "142.91.106.178"],
+
+    // 档位列表：会为每个命中节点各生成一份副本
+    //   up / down 为 null 时不写该字段 → 该副本走 BBR（自适应，适合抖动大的链路）
+    //   auto: true 的档位会纳入「⚡ 自动选择」测速组。同一服务器的各档位
+    //   延迟完全相同，全部纳入会让测速组随机挑到慢档位，所以只放一个
+    tiers: [
+        { tag: "家宽", up: "30 Mbps", down: "80 Mbps", auto: true },
+        { tag: "移动", up: "10 Mbps", down: "50 Mbps", auto: false },
+        { tag: "BBR", up: null, down: null, auto: false }
+    ],
+
+    // 副本名分隔符，以及场景选择组名模板（{name} 替换为原节点名）
+    nameSeparator: " · ",
+    groupNameTemplate: "🎚 {name} 场景",
+
+    // 是否额外保留原始节点（不带带宽）。默认 false：由上面的档位副本取代
+    keepOriginal: false,
+
+    // 是否把副本一并写入 Base64 通用订阅。
+    // mihomo 系客户端能从 hysteria2 链接的 up / down 参数读到带宽，
+    // 其它客户端会忽略这两个参数，只是多出几个同名副本
+    applyToPlainSubscription: true
+};
 
 export default {
     async fetch(request, env) {
         const url = new URL(request.url);
         const path = url.pathname.replace(/\/$/, "") || "/";
         const userAgent = (request.headers.get("User-Agent") || "").toLowerCase();
+
+        // ?scene=0 / off / false 时关闭分场景副本
+        const sceneFlag = (url.searchParams.get("scene") || "").toLowerCase();
+        const useScene = SCENE.enabled && !["0", "off", "false", "no"].includes(sceneFlag);
 
         try {
             // --- 1. 订阅分发逻辑 ---
@@ -21,11 +85,13 @@ export default {
 
                 // 如果是 Clash 客户端或带有 target=clash 参数
                 if (userAgent.includes("clash") || url.searchParams.get("target") === "clash") {
-                    return generateClashResponse(rawContent);
+                    return generateClashResponse(rawContent, { scene: useScene });
                 }
 
                 // 普通订阅返回 Base64（支持中文）
-                const base64 = btoa(unescape(encodeURIComponent(rawContent)));
+                const entries = expandSceneEntries(rawContent, useScene && SCENE.applyToPlainSubscription);
+                const plain = entries.map(e => `${e.body}#${encodeURIComponent(e.name)}`).join("\n");
+                const base64 = btoa(unescape(encodeURIComponent(plain)));
                 return new Response(base64, {
                     headers: { "content-type": "text/plain; charset=utf-8" }
                 });
@@ -82,77 +148,222 @@ export default {
 };
 
 /**
- * 生成 Clash YAML 配置
+ * ============================================================
+ *  链接解析与分场景展开
+ * ============================================================
  */
-function generateClashResponse(rawContent) {
-    const lines = rawContent.split(/\r?\n/);
-    const proxies = [];
-    const usedNames = new Set();
+
+// 端口跳跃链接（host:起始-结束）不符合 URL 规范，先拆出端口段再解析，
+// 否则 new URL 会抛异常导致节点被丢弃
+const PORT_RANGE_RE = /^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^/?#]+):(\d+)-(\d+)([/?#].*)?$/;
+
+/**
+ * 拆出 # 后的名称片段。
+ * 不用 new URL 是因为端口跳跃链接会解析失败，而名称必须能拿到。
+ */
+function splitFragment(raw) {
+    const idx = raw.indexOf("#");
+    if (idx < 0) return { body: raw, name: "" };
+    return { body: raw.slice(0, idx), name: raw.slice(idx + 1) };
+}
+
+function decodeName(fragment) {
+    const s = (fragment || "").replace(/^#/, "");
+    if (!s) return "";
+    try { return decodeURIComponent(s); } catch (_) { return s; }
+}
+
+/**
+ * 解析链接主体，返回 URL、协议名与端口跳跃段。
+ */
+function parseLinkBody(body) {
+    const m = body.match(PORT_RANGE_RE);
+    const portRange = m ? `${m[2]}-${m[3]}` : null;
+    const normalized = m ? `${m[1]}:${m[2]}${m[4] || ""}` : body;
+    const url = new URL(normalized);
+    return { url, protocol: url.protocol.replace(":", ""), portRange };
+}
+
+/**
+ * 往链接主体追加查询参数（保持原有参数不变）。
+ */
+function appendQuery(body, params) {
+    const keys = Object.keys(params || {});
+    if (keys.length === 0) return body;
+    const qs = keys
+        .map(k => `${encodeURIComponent(k)}=${encodeURIComponent(params[k])}`)
+        .join("&");
+    // 主体已有参数用 &，没有则用 ?，末尾已是分隔符则不重复追加
+    const sep = body.indexOf("?") < 0 ? "?" : (/[?&]$/.test(body) ? "" : "&");
+    return `${body}${sep}${qs}`;
+}
+
+/**
+ * 摘掉链接主体里的指定查询参数。
+ *
+ * 分场景副本要在链接上写 up / down，但 URLSearchParams.get() 只返回
+ * 第一个同名参数——如果原链接里已经带了 up / down，直接 append 的话
+ * 档位会被原值压住（取到的是原值而非档位值）。所以先摘干净再追加。
+ */
+function stripQueryKeys(body, keys) {
+    const qi = body.indexOf("?");
+    if (qi < 0) return body;
+    const head = body.slice(0, qi);
+    const kept = body.slice(qi + 1).split("&").filter(pair => {
+        if (!pair) return false;
+        let k = pair.split("=")[0];
+        try { k = decodeURIComponent(k); } catch (_) { /* 保持原样 */ }
+        return keys.indexOf(k.toLowerCase()) < 0;
+    });
+    return kept.length > 0 ? `${head}?${kept.join("&")}` : head;
+}
+
+/**
+ * 判断该节点是否属于分场景副本的目标。
+ * 只有 hysteria 系列才有 up / down 字段，其它协议直接跳过。
+ */
+function isSceneTarget(parsed, name) {
+    const proto = parsed.protocol;
+    if (proto !== "hysteria2" && proto !== "hy2") return false;
+    // 默认 matchMode: "all" —— 所有 hy2 节点都展开
+    if (SCENE.matchMode !== "list") return true;
+    if (SCENE.matchNames.indexOf(name) >= 0) return true;
+    return SCENE.matchServers.indexOf(parsed.url.hostname) >= 0;
+}
+
+/**
+ * 把原始订阅内容展开为条目列表。
+ * 命中分场景规则的节点会被展开成多个副本，其余原样保留。
+ *
+ * 带宽通过链接的 up / down 参数携带——mihomo 的 hysteria2 链接解析器
+ * 会读取这两个参数（common/convert/converter.go），因此 Clash 侧和
+ * Base64 通用订阅可以共用同一份展开结果。
+ *
+ * @returns {Array<{body: string, name: string, up: string|null, down: string|null, scene: string|null, auto: boolean}>}
+ */
+function expandSceneEntries(rawContent, useScene) {
+    const lines = String(rawContent || "").split(/\r?\n/);
+    const entries = [];
 
     lines.forEach((line, i) => {
         const trimmed = line.trim();
         if (!trimmed || !trimmed.includes("://")) return;
-        // 端口跳跃链接（host:起始-结束）不符合 URL 规范，先拆出端口段再解析，否则 new URL 会抛异常导致节点被丢弃
-        const rangeMatch = trimmed.match(/^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^/?#]+):(\d+)-(\d+)([/?#].*)?$/);
-        const portRange = rangeMatch ? `${rangeMatch[2]}-${rangeMatch[3]}` : null;
-        const normalized = rangeMatch ? `${rangeMatch[1]}:${rangeMatch[2]}${rangeMatch[4] || ""}` : trimmed;
-        try {
-            const url = new URL(normalized);
-            const protocol = url.protocol.replace(":", "");
-            const params = url.searchParams;
-            let name = `节点-${i + 1}`;
-            try { name = decodeURIComponent(url.hash.replace("#", "")) || name; } catch (_) {}
 
-            // 名称去重：重名时自动追加序号，避免 Clash 报 duplicate name
-            if (usedNames.has(name)) {
-                let n = 2;
-                while (usedNames.has(`${name}-${n}`)) n++;
-                name = `${name}-${n}`;
+        const frag = splitFragment(trimmed);
+        const name = decodeName(frag.name) || `节点-${i + 1}`;
+
+        let parsed = null;
+        try { parsed = parseLinkBody(frag.body); } catch (_) { parsed = null; }
+
+        // 解析失败的链接仍然原样输出，只是不做副本展开
+        if (useScene && parsed && isSceneTarget(parsed, name)) {
+            const tiers = (SCENE.tiers || []).filter(t => t && t.tag);
+            // 档位配空了就退回原节点，避免节点凭空消失
+            if (tiers.length > 0) {
+                // 链接里原本就带 up / down 时先摘掉，否则档位会被原值压住
+                const baseBody = stripQueryKeys(frag.body, ["up", "down"]);
+                tiers.forEach(t => {
+                    const params = {};
+                    if (t.up) params.up = t.up;
+                    if (t.down) params.down = t.down;
+                    entries.push({
+                        body: appendQuery(baseBody, params),
+                        name: name + SCENE.nameSeparator + t.tag,
+                        up: t.up || null,
+                        down: t.down || null,
+                        scene: name,
+                        auto: !!t.auto
+                    });
+                });
+                if (SCENE.keepOriginal) {
+                    entries.push({ body: frag.body, name, up: null, down: null, scene: null, auto: false });
+                }
+                return;
             }
-            usedNames.add(name);
+        }
 
-            let p = {
-                name, type: protocol, server: url.hostname, port: parseInt(url.port),
-                udp: true, "skip-cert-verify": true
-            };
-
-            // hysteria2 / hy2 协议解析
-            if (protocol === "hysteria2" || protocol === "hy2") {
-                p.type = "hysteria2";
-                p.password = decodeURIComponent(url.username || url.password || "");
-                p["skip-cert-verify"] = ["1", "true"].includes((params.get("insecure") || "").toLowerCase());
-                if (params.get("sni")) p.sni = params.get("sni");
-                // salamander 混淆（可选）
-                if (params.get("obfs") === "salamander" && params.get("obfs-password")) {
-                    p.obfs = "salamander";
-                    p["obfs-password"] = params.get("obfs-password");
-                }
-                // 端口跳跃（可选），Clash 字段为 ports；支持 ?mport= 参数和 host:起始-结束 两种写法
-                if (params.get("mport")) p.ports = params.get("mport");
-                if (portRange) p.ports = portRange;
-            } else if (protocol === "vless") {
-                p.uuid = url.username;
-                p.tls = params.get("security") === "tls" || params.get("security") === "reality";
-                p.network = params.get("type") || "tcp";
-                if (params.get("sni")) p.servername = params.get("sni");
-                if (params.get("flow")) p.flow = params.get("flow");
-                if (params.get("security") === "reality") {
-                    p["reality-opts"] = { "public-key": params.get("pbk"), "short-id": params.get("sid") || "" };
-                    p["client-fingerprint"] = params.get("fp") || "chrome";
-                }
-                if (p.network === "ws") {
-                    p["ws-opts"] = { path: params.get("path") || "/", headers: { Host: params.get("host") || url.hostname } };
-                }
-            } else if (protocol === "trojan") {
-                p.password = url.username;
-                p.tls = true;
-                if (params.get("sni")) p.sni = params.get("sni");
-            }
-            proxies.push(p);
-        } catch (e) {}
+        entries.push({ body: frag.body, name, up: null, down: null, scene: null, auto: false });
     });
 
-    const proxyNames = proxies.length > 0 ? proxies.map(p => p.name) : ["DIRECT"];
+    return entries;
+}
+
+/**
+ * 名称去重，避免 Clash 报 duplicate name。
+ */
+function uniqueName(used, base) {
+    let name = base;
+    let n = 2;
+    while (used.has(name)) { name = `${base}-${n++}`; }
+    used.add(name);
+    return name;
+}
+
+/**
+ * YAML 流式标量安全输出：只在必要时加双引号。
+ * 节点名来自用户输入，出现「,」「:」「#」等字符时不加引号会破坏配置结构。
+ * JSON 字符串本身是合法的 YAML 双引号标量，可直接复用。
+ */
+function yq(value) {
+    const s = String(value);
+    if (s === "" || /[,:\[\]{}#&*!|>'"%@`]/.test(s) || /^\s|\s$/.test(s)) {
+        return JSON.stringify(s);
+    }
+    return s;
+}
+
+/**
+ * 生成 Clash YAML 配置
+ */
+function generateClashResponse(rawContent, options) {
+    const opts = options || {};
+    const entries = expandSceneEntries(rawContent, opts.scene !== false);
+
+    const usedNames = new Set();
+    const proxies = [];
+    // 每个命中节点一个场景选择组，保持出现顺序
+    const sceneGroups = [];
+    const sceneGroupMap = new Map();
+    const autoNames = [];        // 纳入 ⚡ 自动选择
+    const standaloneNames = [];  // 未命中规则的普通节点
+
+    entries.forEach(entry => {
+        let proxy;
+        try {
+            proxy = buildProxy(entry);
+        } catch (_) {
+            return;  // 单条链接解析失败不影响其余节点
+        }
+        if (!proxy) return;
+
+        proxy.name = uniqueName(usedNames, entry.name);
+        proxies.push(proxy);
+
+        if (entry.scene) {
+            let group = sceneGroupMap.get(entry.scene);
+            if (!group) {
+                group = {
+                    name: String(SCENE.groupNameTemplate || "{name} 场景").replace("{name}", entry.scene),
+                    members: []
+                };
+                sceneGroupMap.set(entry.scene, group);
+                sceneGroups.push(group);
+            }
+            group.members.push(proxy.name);
+            if (entry.auto) autoNames.push(proxy.name);
+        } else {
+            standaloneNames.push(proxy.name);
+            autoNames.push(proxy.name);
+        }
+    });
+
+    // 场景组名去重（与原节点名或彼此撞车时不会破坏配置）
+    const usedGroupNames = new Set();
+    sceneGroups.forEach(g => { g.name = uniqueName(usedGroupNames, g.name); });
+
+    const sceneGroupNames = sceneGroups.map(g => g.name);
+    const autoMembers = autoNames.length > 0 ? autoNames : ["DIRECT"];
+    const innerMembers = [...sceneGroupNames, ...standaloneNames];
 
     const yaml = [
         `mixed-port: 7890`,
@@ -162,9 +373,10 @@ function generateClashResponse(rawContent) {
         `proxies:`,
         ...proxies.map(p => `  - ${JSON.stringify(p)}`),
         `proxy-groups:`,
-        `  - { name: 🚀 节点选择, type: select, proxies: [⚡ 自动选择, ${proxyNames.join(", ")}, DIRECT] }`,
-        `  - { name: ⚡ 自动选择, type: url-test, proxies: [${proxyNames.join(", ")}], url: http://www.gstatic.com/generate_204, interval: 300 }`,
-        `  - { name: 🎥 奈飞视频, type: select, proxies: [🚀 节点选择, ${proxyNames.join(", ")}] }`,
+        `  - { name: 🚀 节点选择, type: select, proxies: [${["⚡ 自动选择", ...innerMembers, "DIRECT"].map(yq).join(", ")}] }`,
+        `  - { name: ⚡ 自动选择, type: url-test, proxies: [${autoMembers.map(yq).join(", ")}], url: http://www.gstatic.com/generate_204, interval: 300 }`,
+        ...sceneGroups.map(g => `  - { name: ${yq(g.name)}, type: select, proxies: [${g.members.map(yq).join(", ")}] }`),
+        `  - { name: 🎥 奈飞视频, type: select, proxies: [${["🚀 节点选择", ...innerMembers].map(yq).join(", ")}] }`,
         `  - { name: 📲 电报消息, type: select, proxies: [🚀 节点选择, DIRECT] }`,
         `  - { name: 🍎 苹果服务, type: select, proxies: [DIRECT, 🚀 节点选择] }`,
         `  - { name: 🐟 漏网之鱼, type: select, proxies: [🚀 节点选择, DIRECT] }`,
@@ -178,6 +390,61 @@ function generateClashResponse(rawContent) {
     ].join("\n");
 
     return new Response(yaml, { headers: { "content-type": "text/yaml; charset=utf-8" } });
+}
+
+/**
+ * 由展开后的条目构造单个 Clash 节点对象
+ */
+function buildProxy(entry) {
+    const parsed = parseLinkBody(entry.body);
+    const url = parsed.url;
+    const params = url.searchParams;
+    const protocol = parsed.protocol;
+    const portRange = parsed.portRange;
+
+    let p = {
+        name: entry.name, type: protocol, server: url.hostname, port: parseInt(url.port),
+        udp: true, "skip-cert-verify": true
+    };
+
+    // hysteria2 / hy2 协议解析
+    if (protocol === "hysteria2" || protocol === "hy2") {
+        p.type = "hysteria2";
+        p.password = decodeURIComponent(url.username || url.password || "");
+        p["skip-cert-verify"] = ["1", "true"].includes((params.get("insecure") || "").toLowerCase());
+        if (params.get("sni")) p.sni = params.get("sni");
+        // 上行/下行带宽声明：分场景副本会带上，手动写在链接里也支持。
+        // 只有声明了带宽才会启用 Brutal，否则退回 BBR
+        if (params.get("up")) p.up = params.get("up");
+        if (params.get("down")) p.down = params.get("down");
+        // salamander 混淆（可选）
+        if (params.get("obfs") === "salamander" && params.get("obfs-password")) {
+            p.obfs = "salamander";
+            p["obfs-password"] = params.get("obfs-password");
+        }
+        // 端口跳跃（可选），Clash 字段为 ports；支持 ?mport= 参数和 host:起始-结束 两种写法
+        if (params.get("mport")) p.ports = params.get("mport");
+        if (portRange) p.ports = portRange;
+    } else if (protocol === "vless") {
+        p.uuid = url.username;
+        p.tls = params.get("security") === "tls" || params.get("security") === "reality";
+        p.network = params.get("type") || "tcp";
+        if (params.get("sni")) p.servername = params.get("sni");
+        if (params.get("flow")) p.flow = params.get("flow");
+        if (params.get("security") === "reality") {
+            p["reality-opts"] = { "public-key": params.get("pbk"), "short-id": params.get("sid") || "" };
+            p["client-fingerprint"] = params.get("fp") || "chrome";
+        }
+        if (p.network === "ws") {
+            p["ws-opts"] = { path: params.get("path") || "/", headers: { Host: params.get("host") || url.hostname } };
+        }
+    } else if (protocol === "trojan") {
+        p.password = url.username;
+        p.tls = true;
+        if (params.get("sni")) p.sni = params.get("sni");
+    }
+
+    return p;
 }
 
 /**

@@ -1,0 +1,14 @@
+# 测试生成物
+worker.mjs
+out.yaml
+out_off.yaml
+out_plain.txt
+profile-script.js
+test-log.txt
+*.pyc
+__pycache__/
+
+# 依赖与本地环境
+node_modules/
+.wrangler/
+.dev.vars

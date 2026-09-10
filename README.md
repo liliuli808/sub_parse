@@ -11,6 +11,7 @@
 - 支持中文节点名称，并自动处理 Clash 节点重名
 - Clash 转换支持 VLESS、Trojan 和 Hysteria2/Hy2
 - Hysteria2 支持 `mport` 参数和 `host:起始端口-结束端口` 两种端口跳跃写法
+- 分场景节点副本：同一节点按带宽档位展开为多个副本，适配家宽 / 移动 / 弱网
 
 ## 工作方式
 
@@ -18,6 +19,7 @@
 | --- | --- |
 | `/`、`/sub` | 返回订阅；默认是 Base64，Clash User-Agent 自动返回 YAML |
 | `/sub?target=clash` | 强制返回 Clash YAML |
+| `/sub?scene=0` | 关闭分场景节点副本，返回原始节点 |
 | `/admin` | 管理后台；首次访问时设置管理密码 |
 
 节点数据保存在 KV 的 `vpn_links` 键中，管理密码保存在 `admin_password` 键中。
@@ -118,6 +120,79 @@ Clash 转换目前针对以下内容做了专门处理：
 
 其他 URI 仍会保留在 Base64 原始订阅中，但不保证能正确转换为可用的 Clash 节点。
 
+## 分场景节点副本
+
+### 为什么需要
+
+hysteria2 的 `up` / `down`（带宽声明）有两个性质：
+
+- 它是**硬上限**，实际速率取「声明值」与「服务端限制值」的较小值 —— 填低就是白白限速
+- 只有客户端声明了带宽才会启用 **Brutal** 拥塞控制，不声明则退回 BBR —— 在高 RTT 链路上单流速度差一个数量级
+
+而同一个订阅会同时被家宽、手机 4G、弱网热点等不同网络使用，写死单一档位必然顾此失彼：
+
+| 填法 | 家宽 | 手机 4G |
+| --- | --- | --- |
+| 按家宽填（30/80） | 正常 | 超发，持续重传、白烧流量 |
+| 按手机填（10/50） | 白损失一半以上速度 | 正常 |
+
+### 做法
+
+在生成侧把每个 hysteria2 节点的多个档位各做成一个独立节点，各端按当前网络挑对应档位即可（切节点即切场景），不需要给每台设备单独改配置。
+
+默认对**所有** `hysteria2` / `hy2` 节点生效 —— 以后往订阅里加新节点会自动带上档位，不会漏配。以 `日本2` 为例，会展开为：
+
+```text
+日本2 · 家宽     up: 30 Mbps  down: 80 Mbps
+日本2 · 移动     up: 10 Mbps  down: 50 Mbps
+日本2 · BBR      不写带宽 → 走 BBR 自适应
+```
+
+并自动生成一个场景选择组，挂到 `🚀 节点选择` 下：
+
+```yaml
+- { name: 🎚 日本2 场景, type: select, proxies: [日本2 · 家宽, 日本2 · 移动, 日本2 · BBR] }
+```
+
+### 配置
+
+改 `worker.js` 顶部的 `SCENE` 常量：
+
+| 字段 | 说明 |
+| --- | --- |
+| `matchMode` | `"all"`（默认）处理所有 hy2 节点；`"list"` 只处理下面的白名单 |
+| `matchNames` / `matchServers` | 仅 `matchMode: "list"` 时生效，节点名称或服务器地址任一命中即可 |
+| `tiers` | 档位列表，每个命中节点按此展开。`up` / `down` 为 `null` 时不写该字段（走 BBR） |
+| `tiers[].auto` | 是否纳入 `⚡ 自动选择` 测速组。**同一服务器各档位延迟相同**，全部纳入会让测速组随机挑到慢档位，所以建议只放一个 |
+| `nameSeparator` | 副本名分隔符，默认 ` · ` |
+| `groupNameTemplate` | 场景组名模板，`{name}` 替换为原节点名 |
+| `keepOriginal` | 是否额外保留不带带宽的原始节点，默认 `false` |
+| `applyToPlainSubscription` | 是否把副本一并写入 Base64 通用订阅 |
+
+带宽通过链接的 `up` / `down` 参数携带。mihomo 的 hysteria2 链接解析器会读取这两个参数，因此 Clash YAML 与 Base64 通用订阅可以共用同一份展开结果。
+
+> 链接里原本就带 `up` / `down` 时，展开会先摘掉旧值再写入档位值 —— 因为 `URLSearchParams.get()` 只返回第一个同名参数，直接追加的话档位会被旧值压住。
+
+### 各客户端的支持情况
+
+| 客户端 | 是否生效 |
+| --- | --- |
+| Clash Verge / CMFA / FlClash | 走 Clash YAML，完整支持（含场景组） |
+| Karing 等基于 mihomo 的客户端 | 走 Base64 订阅，能读到 `up` / `down` 参数 |
+| Shadowrocket / Stash 等 | 会忽略参数，只是多出几个同名副本（可把 `applyToPlainSubscription` 设为 `false` 关掉） |
+
+### 与 Clash Verge 扩展脚本的关系
+
+如果同时使用了 Clash Verge 的「扩展脚本」给节点补带宽，需要让脚本跳过这里已经处理好的副本（`up` / `down` 已存在，或名字带档位后缀），否则会把各档位统一改写成同一个值。
+
+注意 `BBR` 档是**故意不带** `up` / `down` 的，只判断「已有带宽」不够 —— 还必须跳过名字带档位后缀的节点。
+
+脚本与订阅侧的默认口径已对齐：都是「所有 hysteria2 节点」。订阅侧正常工作时脚本什么都不做；一旦订阅侧回退（`?scene=0` 或没跟上），脚本按 `30/80` 给所有 hy2 节点兜底。
+
+### 开关
+
+订阅地址加 `?scene=0`（或 `off` / `false` / `no`）即可临时关闭，返回原始节点列表。
+
 ## 本地开发
 
 ```bash
@@ -130,10 +205,30 @@ npx wrangler dev
 
 ```text
 .
-├── worker.js       # 路由、鉴权页面、管理后台和订阅转换逻辑
+├── worker.js       # 路由、鉴权页面、管理后台、订阅转换与分场景副本逻辑
 ├── wrangler.toml   # Worker 与 KV 绑定配置
+├── test/           # 本地测试
 └── README.md
 ```
+
+### 测试
+
+```bash
+sh test/run.sh
+```
+
+会依次跑：端到端生成（Clash YAML / Base64 / `?scene=0`）、边界与异常路径（37 项）、扩展脚本回归（17 项）、以及用 YAML 解析器做的结构校验。
+
+`test/run.sh` 会把 `worker.js` 复制成 `worker.mjs` 再跑 —— 因为项目根目录没有 `package.json` 声明 `type=module`，Node 会按 CommonJS 解析 `.js`。复制成 `.mjs` 可以绕开，不必为了跑测试去动部署用的 wrangler 配置。
+
+验证生成结果是否被真实内核接受，可以用 mihomo 自带的配置检查：
+
+```bash
+mihomo -t -f out.yaml
+# configuration file out.yaml test is successful
+```
+
+注意 `-d` 指向的目录会被写入 `geoip.metadb`，建议用临时目录。
 
 ## 安全提示
 
