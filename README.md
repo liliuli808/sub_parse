@@ -12,17 +12,31 @@
 - Clash 转换支持 VLESS、Trojan 和 Hysteria2/Hy2
 - Hysteria2 支持 `mport` 参数和 `host:起始端口-结束端口` 两种端口跳跃写法
 - 分场景节点副本：同一节点按带宽档位展开为多个副本，适配家宽 / 移动 / 弱网
+- 订阅地址带 token 鉴权：没有 token 拿不到任何节点内容
+- token 轮换带宽限期，换 token 不用一次性改完所有设备
 
 ## 工作方式
 
 | 地址 | 用途 |
 | --- | --- |
-| `/`、`/sub` | 返回订阅；默认是 Base64，Clash User-Agent 自动返回 YAML |
-| `/sub?target=clash` | 强制返回 Clash YAML |
-| `/sub?scene=0` | 关闭分场景节点副本，返回原始节点 |
+| `/`、`/sub` | 返回订阅；默认是 Base64，Clash User-Agent 自动返回 YAML。**必须带 token** |
+| `/sub?token=xxx` | 带 token 的订阅地址（后台里可直接复制现成的） |
+| `/sub/<token>` | 同上，路径写法 |
+| `/sub?token=xxx&target=clash` | 强制返回 Clash YAML |
+| `/sub?token=xxx&scene=0` | 关闭分场景节点副本，返回原始节点 |
 | `/admin` | 管理后台；首次访问时设置管理密码 |
+| `/admin/logout` | 退出登录 |
+| `POST /update-links` | 保存节点（需登录） |
+| `POST /admin/token` | 轮换 / 自定义订阅 token（需登录） |
 
-节点数据保存在 KV 的 `vpn_links` 键中，管理密码保存在 `admin_password` 键中。
+KV 里的键：
+
+| 键 | 内容 |
+| --- | --- |
+| `vpn_links` | 节点链接 |
+| `admin_password` | 管理密码 |
+| `sub_token` | 当前订阅 token |
+| `sub_token_prev` | 轮换前旧 token 及其失效时间（宽限期用） |
 
 ## 部署
 
@@ -83,21 +97,61 @@ https://你的域名/admin
 
 首次访问会显示密码设置页。设置完成后即可进入后台，添加节点并点击“保存所有更改”。
 
+后台进来后先看顶部的「订阅鉴权」面板：如果之前没配过 token，这里会自动生成一个，并给出两条已经带好 token 的订阅地址，直接复制到客户端即可。**在此之前，不带 token 的订阅地址会返回 403。**
+
 ## 使用订阅
+
+订阅地址必须带 token。最省事的做法是直接打开后台，把「订阅鉴权」面板里的两条地址复制走 —— 那里已经带好了 token。
 
 ### Base64 通用订阅
 
 ```text
-https://你的域名/sub
+https://你的域名/sub?token=<你的 token>
 ```
 
 ### Clash/Mihomo 订阅
 
 ```text
-https://你的域名/sub?target=clash
+https://你的域名/sub?token=<你的 token>&target=clash
 ```
 
-当请求的 User-Agent 中包含 `clash` 时，`/` 和 `/sub` 也会自动返回 Clash YAML。需要稳定指定格式时，建议显式添加 `?target=clash`。
+当请求的 User-Agent 中包含 `clash` 时，`/` 和 `/sub` 也会自动返回 Clash YAML。需要稳定指定格式时，建议显式添加 `&target=clash`。
+
+也支持另外两种传法，适合脚本和 curl：
+
+```bash
+# 路径写法
+curl 'https://你的域名/sub/<你的 token>?target=clash'
+
+# 请求头写法
+curl -H 'Authorization: Bearer <你的 token>' 'https://你的域名/sub?target=clash'
+```
+
+## 订阅鉴权
+
+### 为什么需要
+
+原来订阅地址就是「域名 + /sub」。域名好猜，链接也容易从浏览器记录、同步软件、截图里泄漏出去，而一旦泄漏就等于把全部节点交出去了 —— 路径本身不构成任何秘密。
+
+所以真正需要保密的应该是 URL 里的随机串。加了 token 之后，**URL 本身就是密码**。
+
+### 行为
+
+- 没有 token、或 token 不对 → 一律 `403`，不返回任何节点内容
+- **失败即关闭**：token 没配好时订阅是拉不动的，不会退化成谁都能读
+- 鉴权在订阅入口统一处理，Clash 的 User-Agent 识别和 `?scene=0` 都不能绕过
+
+### 轮换
+
+后台「订阅鉴权」面板可以一键重新生成，也可以填一个自定义 token（8-128 位，只允许字母、数字、`-`、`_`）。
+
+轮换后旧 token 会保留一段宽限期（默认 24 小时）仍然可用，这样不必一次性把所有设备都改完。宽限期在 `worker.js` 的 `AUTH.graceHours` 里改，设为 `0` 即立即失效。
+
+首次进入后台时，如果还没有配过 token，会自动生成一个并提示你立刻替换客户端地址 —— 免得部署完忘了配，订阅直接 403 还不知道去哪拿 token。
+
+### 关掉鉴权
+
+调试时可以把 `worker.js` 顶部的 `AUTH.enabled` 改成 `false`。**不建议在公网长期这样跑。**
 
 ## 节点格式
 
@@ -191,7 +245,7 @@ hysteria2 的 `up` / `down`（带宽声明）有两个性质：
 
 ### 开关
 
-订阅地址加 `?scene=0`（或 `off` / `false` / `no`）即可临时关闭，返回原始节点列表。
+订阅地址加 `?scene=0`（或 `off` / `false` / `no`）即可临时关闭，返回原始节点列表。注意 token 仍然要带，例如 `?token=xxx&scene=0`。
 
 ## 本地开发
 
@@ -217,9 +271,21 @@ npx wrangler dev
 sh test/run.sh
 ```
 
-会依次跑：端到端生成（Clash YAML / Base64 / `?scene=0`）、边界与异常路径（37 项）、扩展脚本回归（17 项）、以及用 YAML 解析器做的结构校验。
+会依次跑五步：
+
+| 步骤 | 内容 |
+| --- | --- |
+| 1 | 端到端生成（Clash YAML / Base64 / `?scene=0`）+ 鉴权闸门 |
+| 2 | 鉴权回归：订阅 token、轮换宽限期、后台会话、改密、伪造 cookie（70 项） |
+| 3 | 边界与异常路径（38 项） |
+| 4 | Clash Verge 扩展脚本回归（17 项） |
+| 5 | 用 YAML 解析器做结构校验 |
+
+测试里用 `test/kv.mjs` 的内存 KV 替掉 Workers KV，用 `test/bootstrap.mjs` 补 WebCrypto。
 
 `test/run.sh` 会把 `worker.js` 复制成 `worker.mjs` 再跑 —— 因为项目根目录没有 `package.json` 声明 `type=module`，Node 会按 CommonJS 解析 `.js`。复制成 `.mjs` 可以绕开，不必为了跑测试去动部署用的 wrangler 配置。
+
+`bootstrap.mjs` 存在的原因：worker 用的 WebCrypto 在 Cloudflare Workers 里是内置全局，但 Node 要 19 才默认暴露全局 `crypto`。本机 WSL 是 Node 18，不补的话 worker 里一调就是 `crypto is not defined` → 500。生产代码不该为测试环境打补丁，所以补在测试这一侧。
 
 验证生成结果是否被真实内核接受，可以用 mihomo 自带的配置检查：
 
@@ -232,12 +298,30 @@ mihomo -t -f out.yaml
 
 ## 安全提示
 
-- 管理密码和节点内容当前以明文保存在 KV 中；请勿复用重要密码。
-- 首次部署后应尽快完成密码初始化，避免他人抢先设置管理员密码。
-- 当前鉴权适合个人或轻量使用。公网长期使用时，建议在 `/admin*` 和 `/update-links` 前增加 Cloudflare Access 等额外访问控制。
-- 请妥善保管订阅地址；任何获得该地址的人都能读取其中的节点信息。
+### 已经做了的
+
+- **订阅鉴权**：`/` 和 `/sub` 都必须带 token，否则一律 403；Clash User-Agent 识别、`?scene=0` 都不能绕过。token 比较用定长实现，避免通过响应耗时逐位试探。
+- **后台会话**：cookie 值不再是固定的 `valid`，而是 `HMAC-SHA256(管理密码, 固定盐)`，并且按 cookie 名精确匹配。改密码即让所有旧会话立即失效。
+- **初始化密码一次性**：`/admin/setup` 在已设过密码后会被拒绝，避免被人抢先改掉管理员密码。
+- **改密入口**：后台可改管理密码（`POST /admin/password`），改完自动换发新票据，当前页面不会掉线。
+
+### 还需要注意的
+
+- 管理密码和节点内容以**明文**保存在 KV 中；请勿复用重要密码。
+- **token 就是密码**：任何拿到完整订阅 URL 的人都能读到全部节点。别把带 token 的地址发到公开场合、截图或同步到不可信的地方。
+- 首次部署后请尽快访问 `/admin` 完成密码初始化。
+- 登录接口没有做频率限制，弱密码仍可能被在线爆破；请用长一点的管理密码。
+- 需要更强保护时，建议在 `/admin*` 前再加一层 Cloudflare Access。
 
 ## 常见问题
+
+### 订阅返回 403
+
+订阅请求必须带 token。到 `/admin` 顶部的「订阅鉴权」面板复制带 token 的完整地址；如果是刚部署还没配过 token，进一次后台就会自动生成。
+
+### 改了 token 之后老设备连不上
+
+轮换后旧 token 默认只保留 24 小时宽限期。过期后到后台重新复制地址换到设备上，或者把 `AUTH.graceHours` 调大。
 
 ### 页面提示没有绑定 `sub` KV
 
@@ -245,7 +329,7 @@ mihomo -t -f out.yaml
 
 ### Clash 没有收到 YAML
 
-将订阅地址改为 `/sub?target=clash`，不要只依赖客户端 User-Agent 自动识别。
+将订阅地址改为 `/sub?token=xxx&target=clash`，不要只依赖客户端 User-Agent 自动识别。
 
 ### 本地后台看不到线上节点
 

@@ -12,3 +12,6 @@ __pycache__/
 node_modules/
 .wrangler/
 .dev.vars
+
+# Agent 工作区记忆，不属于代码
+.workbuddy/

@@ -1,5 +1,16 @@
 // 边界与异常路径测试
+import './bootstrap.mjs';            // 先补齐 WebCrypto（Node 18 没有全局 crypto）
 import worker, { SCENE } from './worker.mjs';
+import { makeEnv, adminCookie } from './kv.mjs';
+
+const TOKEN = 'edge-test-token-0123456789abcdef';
+
+// 订阅接口现在必须带 token。默认给所有请求补上，需要测鉴权本身的用例
+// 自己在 URL 里显式写 token= 即可（下面用 includes 判断，不会重复追加）
+function withToken(url) {
+    if (url.includes('token=')) return url;
+    return url + (url.includes('?') ? '&' : '?') + 'token=' + TOKEN;
+}
 
 let pass = 0, fail = 0;
 function check(name, cond, extra = '') {
@@ -8,8 +19,8 @@ function check(name, cond, extra = '') {
 }
 
 async function gen(links, url = 'https://x/sub?target=clash') {
-    const env = { sub: { get: async (k) => (k === 'vpn_links' ? links : null), put: async () => {} } };
-    const res = await worker.fetch(new Request(url), env);
+    const env = makeEnv({ vpn_links: links, sub_token: TOKEN });
+    const res = await worker.fetch(new Request(withToken(url)), env);
     return await res.text();
 }
 
@@ -85,8 +96,8 @@ const j = await gen('hysteria2://p@142.91.106.165:24443?sni=a.com#日本2', 'htt
 check('scene=0 不展开', (j.match(/"name":"日本2/g) || []).length === 1 && !j.includes('场景'));
 
 // —— K. Base64 订阅同时展开 ——
-const env2 = { sub: { get: async () => 'hysteria2://p@142.91.106.165:24443?sni=a.com&obfs=salamander&obfs-password=z#日本2', put: async () => {} } };
-const kres = await worker.fetch(new Request('https://x/sub'), env2);
+const env2 = makeEnv({ vpn_links: 'hysteria2://p@142.91.106.165:24443?sni=a.com&obfs=salamander&obfs-password=z#日本2', sub_token: TOKEN });
+const kres = await worker.fetch(new Request(`https://x/sub?token=${TOKEN}`), env2);
 const ktext = Buffer.from(await kres.text(), 'base64').toString('utf8');
 const klines = ktext.split('\n').filter(Boolean);
 check('Base64 订阅展开为 3 行', klines.length === 3, klines.length);
@@ -95,13 +106,14 @@ check('Base64 行名称正确编码', klines[0].endsWith('#' + encodeURIComponen
 check('BBR 档不加带宽参数', !klines[2].includes('up='));
 
 // —— L. 后台页面仍可渲染（注入防护未被破坏）——
-const envAdmin = { sub: { get: async (k) => (k === 'admin_password' ? 'x' : 'hysteria2://p@a.com:443#A') } };
+const envAdmin = makeEnv({ admin_password: 'x', vpn_links: 'hysteria2://p@a.com:443#A', sub_token: TOKEN });
 const login = await worker.fetch(new Request('https://x/admin'), envAdmin);
 check('未登录跳登录页', (await login.text()).includes('管理员登录'));
-const dash = await worker.fetch(new Request('https://x/admin', { headers: { Cookie: '__Host-sublink_session=valid' } }), envAdmin);
+const dash = await worker.fetch(new Request('https://x/admin', { headers: { Cookie: adminCookie('x') } }), envAdmin);
 const html = await dash.text();
 check('登录后正常返回后台 HTML', html.includes('SubLink Pro') && dash.status === 200, `status=${dash.status}`);
 check('后台注入防护仍在', html.includes('rawLinks = `hysteria2://p@a.com:443#A`'));
+check('后台展示 token 与含 token 的订阅地址', html.includes(TOKEN) && html.includes('token=' + TOKEN));
 
 console.log(`\n结果: ${pass} 通过 / ${fail} 失败`);
 if (fail > 0) process.exit(1);

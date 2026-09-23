@@ -5,10 +5,11 @@
 #  用法：  sh test/run.sh
 #
 #  跑什么：
-#    1. test.mjs              端到端生成三份订阅输出（Clash / Base64 / scene=0）
-#    2. test-edge.mjs         边界与异常路径（30 项）
-#    3. test-profile-script.mjs  Clash Verge 扩展脚本回归（可选，需 profile-script.js）
-#    4. verify_yaml.py        用 YAML 解析器校验生成结果的结构与引用完整性
+#    1. test.mjs                端到端生成三份订阅输出（Clash / Base64 / scene=0）+ 鉴权闸门
+#    2. test-auth.mjs           订阅 token 与后台会话鉴权（回归防线，别删）
+#    3. test-edge.mjs           边界与异常路径
+#    4. test-profile-script.mjs Clash Verge 扩展脚本回归（可选，需 profile-script.js）
+#    5. verify_yaml.py          用 YAML 解析器校验生成结果的结构与引用完整性
 #
 #  为什么要把 worker.js 复制成 worker.mjs：
 #    worker.js 用的是 ESM（export default），但项目根目录没有 package.json
@@ -23,15 +24,19 @@ trap 'rm -f worker.mjs out.yaml out_off.yaml out_plain.txt profile-script.js tes
 
 cp ../worker.js worker.mjs
 
-echo "=============== 1/4 端到端生成 ==============="
+echo "=============== 1/5 端到端生成 ==============="
 node test.mjs
 
 echo
-echo "=============== 2/4 边界与异常 ==============="
+echo "=============== 2/5 鉴权（订阅 token / 后台会话）==============="
+node test-auth.mjs
+
+echo
+echo "=============== 3/5 边界与异常 ==============="
 node test-edge.mjs
 
 echo
-echo "=============== 3/4 扩展脚本回归 ==============="
+echo "=============== 4/5 扩展脚本回归 ==============="
 PROFILE_SCRIPT="${PROFILE_SCRIPT:-/mnt/c/Users/Administrator/AppData/Roaming/io.github.clash-verge-rev.clash-verge-rev/profiles/skOmeZg8yzL2.js}"
 if [ -f "$PROFILE_SCRIPT" ]; then
     cp "$PROFILE_SCRIPT" profile-script.js
@@ -41,7 +46,7 @@ else
 fi
 
 echo
-echo "=============== 4/4 YAML 结构校验 ==============="
+echo "=============== 5/5 YAML 结构校验 ==============="
 RC=0
 if command -v python3 >/dev/null 2>&1 && python3 -c "import yaml" 2>/dev/null; then
     # 注意不能用 `cmd || echo 跳过`：那样会把真实的校验失败伪装成「跳过」
