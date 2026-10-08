@@ -504,6 +504,23 @@ function generateClashResponse(rawContent, options) {
         `  - { name: 🍎 苹果服务, type: select, proxies: [DIRECT, 🚀 节点选择] }`,
         `  - { name: 🐟 漏网之鱼, type: select, proxies: [🚀 节点选择, DIRECT] }`,
         `rules:`,
+        // 私有网段与本地域名直连。缺了这段，局域网地址（192.168.x）和裸主机名
+        // （docker 服务名如 redis）会落到兜底组被送进代理，在节点侧反复解析失败，
+        // 既白白消耗流量，又刷爆服务端日志。
+        // no-resolve：按字面 IP 匹配，不触发 DNS 解析。
+        `  - IP-CIDR,127.0.0.0/8,DIRECT,no-resolve`,
+        `  - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve`,
+        `  - IP-CIDR,172.16.0.0/12,DIRECT,no-resolve`,
+        `  - IP-CIDR,192.168.0.0/16,DIRECT,no-resolve`,
+        `  - IP-CIDR,100.64.0.0/10,DIRECT,no-resolve`,
+        `  - IP-CIDR,169.254.0.0/16,DIRECT,no-resolve`,
+        `  - IP-CIDR6,fe80::/10,DIRECT,no-resolve`,
+        `  - IP-CIDR6,fc00::/7,DIRECT,no-resolve`,
+        `  - DOMAIN-SUFFIX,local,DIRECT`,
+        `  - DOMAIN-SUFFIX,lan,DIRECT`,
+        // 无点号主机名（redis / localhost / db 之类）必定是内网服务；
+        // 公网域名必然带 TLD（有点号），故此正则不会误伤正常域名。
+        `  - DOMAIN-REGEX,^[^.]+$,DIRECT`,
         `  - DOMAIN-SUFFIX,google.com,🚀 节点选择`,
         `  - DOMAIN-SUFFIX,netflix.com,🎥 奈飞视频`,
         `  - DOMAIN-SUFFIX,telegram.org,📲 电报消息`,
@@ -527,14 +544,23 @@ function buildProxy(entry) {
 
     let p = {
         name: entry.name, type: protocol, server: url.hostname, port: parseInt(url.port),
-        udp: true, "skip-cert-verify": true
+        udp: true, "skip-cert-verify": false
     };
+
+    // 仅当链接显式声明 insecure / allowInsecure 时才跳过证书校验。
+    // 默认不跳过：对 vless+tls、trojan 这类走标准 TLS 的协议，
+    // 无条件 skip 等于接受任意证书，可被中间人冒充。
+    // （REALITY 用 pbk 做密钥认证，不走证书链校验，该字段对它无影响。）
+    const insecure = ["1", "true"].includes(
+        (params.get("insecure") || params.get("allowInsecure") || "").toLowerCase()
+    );
 
     // hysteria2 / hy2 协议解析
     if (protocol === "hysteria2" || protocol === "hy2") {
         p.type = "hysteria2";
         p.password = decodeURIComponent(url.username || url.password || "");
-        p["skip-cert-verify"] = ["1", "true"].includes((params.get("insecure") || "").toLowerCase());
+        // hy2 普遍使用自签证书 / SNI 与真实域名不符，需按链接声明决定是否跳过
+        p["skip-cert-verify"] = insecure;
         if (params.get("sni")) p.sni = params.get("sni");
         // 上行/下行带宽声明：分场景副本会带上，手动写在链接里也支持。
         // 只有声明了带宽才会启用 Brutal，否则退回 BBR
@@ -561,10 +587,14 @@ function buildProxy(entry) {
         if (p.network === "ws") {
             p["ws-opts"] = { path: params.get("path") || "/", headers: { Host: params.get("host") || url.hostname } };
         }
+        // REALITY 用 pbk 做密钥认证，与证书链校验无关，无需该字段；
+        // 只有普通 vless+tls 才按链接声明决定是否跳过校验
+        if (p.tls && params.get("security") !== "reality") p["skip-cert-verify"] = insecure;
     } else if (protocol === "trojan") {
         p.password = url.username;
         p.tls = true;
         if (params.get("sni")) p.sni = params.get("sni");
+        p["skip-cert-verify"] = insecure;
     }
 
     return p;

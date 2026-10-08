@@ -115,6 +115,43 @@ for _n in SCENE_NODES:
     if 'up' in bbr or 'down' in bbr:
         problems.append(f"{_n} · BBR 不应带带宽字段")
 
+# 9. 私有网段必须直连：漏掉会把内网流量送进代理，
+#    在节点侧反复解析失败并刷爆服务端日志（曾占日志 88%）。
+rules = d.get('rules', [])
+rule_text = "\n".join(str(r) for r in rules)
+need_cidr = ['127.0.0.0/8', '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16']
+for cidr in need_cidr:
+    if f'IP-CIDR,{cidr},DIRECT' not in rule_text:
+        problems.append(f"rules 缺少私有网段直连: {cidr}")
+
+# 10. 裸主机名（无点号，如 redis/db）必须直连，否则会进代理被解析失败。
+#     用 DOMAIN-REGEX 匹配，DOMAIN-SUFFIX 拦不住单段主机名。
+if 'DOMAIN-REGEX,^[^.]+$,DIRECT' not in rule_text:
+    problems.append("rules 缺少无点号主机名直连: DOMAIN-REGEX,^[^.]+$,DIRECT")
+
+# 11. 私有网段规则必须排在 GEOIP,CN 之前，且 MATCH 必须是最后一条
+idx_match = next((i for i, r in enumerate(rules) if str(r).startswith('MATCH,')), -1)
+if idx_match != len(rules) - 1:
+    problems.append("MATCH 必须且只能是最后一条规则")
+idx_private = next((i for i, r in enumerate(rules) if '192.168.0.0/16' in str(r)), -1)
+idx_geoip = next((i for i, r in enumerate(rules) if str(r).startswith('GEOIP,')), -1)
+if idx_private == -1 or (idx_geoip != -1 and idx_private > idx_geoip):
+    problems.append("私有网段规则必须排在 GEOIP 之前")
+
+# 12. skip-cert-verify 必须由链接声明驱动，不能无条件为 true。
+#     历史 bug：buildProxy 默认给所有协议写 true，导致普通 TLS 节点
+#     静默接受任意证书（可被中间人冒充，安全降级）。
+#     测试数据里只有「奔哥专用」的链接带 insecure=1，故只有它应为 true。
+#     这里按「行为契约」检查全部节点，而不只是 hysteria2 —— 否则
+#     hy2 分支的显式覆盖会掩盖默认值被改回 true 的问题。
+for p in proxies:
+    expect_skip = '奔哥专用' in p['name']
+    if p.get('skip-cert-verify') is not expect_skip:
+        problems.append(
+            f"{p['name']} skip-cert-verify={p.get('skip-cert-verify')}，"
+            f"期望 {expect_skip}（应跟随链接的 insecure 参数）"
+        )
+
 print()
 if problems:
     print(f"!!! {len(problems)} 个问题:")
