@@ -342,6 +342,19 @@ function stripQueryKeys(body, keys) {
 }
 
 /**
+ * 取出去掉方括号的主机名。
+ *
+ * URL.hostname 对 IPv6 字面量返回 "[2a12:a304:4:ba9::a]" 这种带方括号的形式，
+ * 而 Clash / Mihomo 的 server 字段要求裸地址——它自己会加方括号再拼端口，
+ * 值里已带方括号就会变成 "[[2a12:...]]:56211"，报 "missing port in address"，
+ * 节点直接连不上。统一在解析入口剥掉。
+ */
+function bareHost(url) {
+    const h = url.hostname;
+    return h.startsWith("[") && h.endsWith("]") ? h.slice(1, -1) : h;
+}
+
+/**
  * 判断该节点是否属于分场景副本的目标。
  * 只有 hysteria 系列才有 up / down 字段，其它协议直接跳过。
  */
@@ -351,7 +364,12 @@ function isSceneTarget(parsed, name) {
     // 默认 matchMode: "all" —— 所有 hy2 节点都展开
     if (SCENE.matchMode !== "list") return true;
     if (SCENE.matchNames.indexOf(name) >= 0) return true;
-    return SCENE.matchServers.indexOf(parsed.url.hostname) >= 0;
+    // matchServers 两侧都按裸地址比对，用户填 IPv6 时带不带方括号都能命中
+    const host = bareHost(parsed.url);
+    return SCENE.matchServers.some(s => {
+        const t = String(s).trim();
+        return (t.startsWith("[") && t.endsWith("]") ? t.slice(1, -1) : t) === host;
+    });
 }
 
 /**
@@ -543,7 +561,7 @@ function buildProxy(entry) {
     const portRange = parsed.portRange;
 
     let p = {
-        name: entry.name, type: protocol, server: url.hostname, port: parseInt(url.port),
+        name: entry.name, type: protocol, server: bareHost(url), port: parseInt(url.port),
         udp: true, "skip-cert-verify": false
     };
 
