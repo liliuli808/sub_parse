@@ -105,6 +105,14 @@ check('Base64 行含 up/down 参数', klines[0].includes('up=30%20Mbps') && klin
 check('Base64 行名称正确编码', klines[0].endsWith('#' + encodeURIComponent('日本2 · 家宽')));
 check('BBR 档不加带宽参数', !klines[2].includes('up='));
 
+// —— K2. IPv6 字面量：server 必须去掉方括号 ——
+// URL.hostname 对 IPv6 返回 "[2a12:...]" 带方括号，直接写进 Clash 的 server
+// 会被 Mihomo 再包一层变成 "[[2a12:...]]:56211"，报 missing port in address
+const k6 = await gen('hysteria2://p@[2a12:a304:4:ba9::a]:56211?sni=hy2c.susie.one#IPv6节点');
+check('IPv6 server 去掉方括号', k6.includes('"server":"2a12:a304:4:ba9::a"'), k6.match(/"server":"[^"]*"/g));
+check('IPv6 server 不含双层方括号', !k6.includes('[['));
+check('IPv6 节点仍正常展开 3 份', (k6.match(/"name":"IPv6节点/g) || []).length === 3);
+
 // —— L. 后台页面仍可渲染（注入防护未被破坏）——
 const envAdmin = makeEnv({ admin_password: 'x', vpn_links: 'hysteria2://p@a.com:443#A', sub_token: TOKEN });
 const login = await worker.fetch(new Request('https://x/admin'), envAdmin);
